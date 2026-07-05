@@ -1,268 +1,175 @@
 """
-Movie Recommendation System — Live Application
-Market Basket Analysis with the Apriori Algorithm (MovieLens 1M)
+Core recommendation logic — identical to the original notebook (finall.ipynb).
+Kept free of any Streamlit imports so it can be unit-tested independently.
 """
 
-import time
+import itertools
+from collections import defaultdict
 
+import numpy as np
 import pandas as pd
-import streamlit as st
-import plotly.express as px
+from mlxtend.frequent_patterns import apriori, association_rules
+from mlxtend.preprocessing import TransactionEncoder
 
-import core
+RATING_THRESHOLD = 4
 
-st.set_page_config(page_title="Movie Recommender — Apriori", page_icon="🎬", layout="wide")
+AGE_MAP = {
+    1: "Under 18", 18: "18-24", 25: "25-34", 35: "35-44",
+    45: "45-49", 50: "50-55", 56: "56+",
+}
 
-AGE_MAP = core.AGE_MAP
-OCCUPATION_MAP = core.OCCUPATION_MAP
-RATING_THRESHOLD = core.RATING_THRESHOLD
-
-
-@st.cache_data(show_spinner=False)
-def cached_load_data():
-    return core.load_data(data_dir="data")
-
-
-@st.cache_resource(show_spinner=False)
-def cached_train_model(min_support: float, min_lift: float):
-    movies, ratings, _ = cached_load_data()
-    freq, rules, n_tx, n_items = core.train_apriori_model(movies, ratings, min_support, min_lift)
-    return {"frequent_itemsets": freq, "rules": rules, "n_transactions": n_tx, "n_items": n_items}
+OCCUPATION_MAP = {
+    0: "other / not specified", 1: "academic/educator", 2: "artist",
+    3: "clerical/admin", 4: "college/grad student", 5: "customer service",
+    6: "doctor/health care", 7: "executive/managerial", 8: "farmer",
+    9: "homemaker", 10: "K-12 student", 11: "lawyer", 12: "programmer",
+    13: "retired", 14: "sales/marketing", 15: "scientist",
+    16: "self-employed", 17: "technician/engineer", 18: "tradesman/craftsman",
+    19: "unemployed", 20: "writer",
+}
 
 
-@st.cache_resource(show_spinner=False)
-def cached_rule_index(_rules_df, cache_key):
-    return core.build_rule_index(_rules_df)
-
-
-@st.cache_data(show_spinner=False)
-def cached_train_test_split(_ratings_df, cache_key):
-    return core.make_train_test_split(_ratings_df)
-
-
-st.sidebar.title("🎬 Movie Recommender")
-st.sidebar.caption("Apriori-based Market Basket Analysis · MovieLens 1M")
-
-page = st.sidebar.radio(
-    "Navigate",
-    ["🏠 Overview & EDA", "👤 Recommend for a User", "✨ New Session (Cold Start)",
-     "🔗 Association Rules Explorer", "📈 Model Evaluation"],
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Model Settings")
-min_support = st.sidebar.slider("Min support", 0.02, 0.15, 0.05, 0.01,
-                                 help="Minimum fraction of users an itemset must appear in.")
-min_lift = st.sidebar.slider("Min lift", 1.0, 3.0, 1.2, 0.1,
-                              help="Minimum lift threshold for keeping a rule.")
-
-movies, ratings, users = cached_load_data()
-
-with st.spinner("Training the Apriori model (runs once, then cached)…"):
-    model = cached_train_model(min_support, min_lift)
-
-rules = model["rules"]
-rule_index = cached_rule_index(rules, cache_key=f"{min_support}-{min_lift}")
-
-st.sidebar.markdown("---")
-st.sidebar.metric("Frequent itemsets", f"{len(model['frequent_itemsets']):,}")
-st.sidebar.metric("Association rules", f"{len(rules):,}")
-st.sidebar.metric("User transactions", f"{model['n_transactions']:,}")
-
-
-if page == "🏠 Overview & EDA":
-    st.title("🎬 Movie Recommendation System")
-    st.markdown("### Market Basket Analysis with the Apriori Algorithm")
-    st.markdown(
-        "This live app mines association rules from the **MovieLens 1M** dataset "
-        "(6,040 users, 3,883 movies, 1,000,209 ratings) to generate personalized "
-        "and cold-start movie recommendations."
+def load_data(data_dir="data"):
+    movies = pd.read_csv(
+        f"{data_dir}/movies.dat", sep="::", engine="python",
+        names=["MovieID", "Title", "Genres"], encoding="latin-1",
     )
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Movies", f"{len(movies):,}")
-    c2.metric("Users", f"{len(users):,}")
-    c3.metric("Ratings", f"{len(ratings):,}")
-
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        rating_counts = ratings["Rating"].value_counts().sort_index()
-        fig = px.bar(
-            x=rating_counts.index, y=rating_counts.values,
-            labels={"x": "Rating", "y": "Count"}, title="Distribution of Movie Ratings",
-            color_discrete_sequence=["#458588"],
-        )
-        st.plotly_chart(fig, width='stretch')
-
-        gender_counts = users["Gender"].value_counts()
-        fig2 = px.pie(
-            values=gender_counts.values,
-            names=["Male" if g == "M" else "Female" for g in gender_counts.index],
-            title="Gender Distribution of Users", color_discrete_sequence=["#458588", "#b16286"],
-        )
-        st.plotly_chart(fig2, width='stretch')
-
-    with col2:
-        users_age_df = users.copy()
-        users_age_df["AgeGroup"] = users_age_df["Age"].map(AGE_MAP)
-        age_order = ["Under 18", "18-24", "25-34", "35-44", "45-49", "50-55", "56+"]
-        age_counts = users_age_df["AgeGroup"].value_counts().reindex(age_order)
-        fig3 = px.bar(
-            x=age_counts.index, y=age_counts.values,
-            labels={"x": "Age Group", "y": "Count"}, title="Age Distribution of Users",
-            color_discrete_sequence=["#d65d0e"],
-        )
-        st.plotly_chart(fig3, width='stretch')
-
-        genre_series = movies["Genres"].str.split("|").explode()
-        top_genres = genre_series.value_counts().head(10)
-        fig4 = px.bar(
-            x=top_genres.values, y=top_genres.index, orientation="h",
-            labels={"x": "Number of Movies", "y": "Genre"}, title="Top 10 Genres",
-            color_discrete_sequence=["#689d6a"],
-        )
-        fig4.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig4, width='stretch')
-
-
-elif page == "👤 Recommend for a User":
-    st.title("👤 Personalized Recommendations")
-    st.markdown("Pick an existing `UserID` from the dataset to see their profile and generate recommendations.")
-
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        user_id = st.number_input(
-            "User ID", min_value=int(users["UserID"].min()), max_value=int(users["UserID"].max()),
-            value=1, step=1,
-        )
-        n_recs = st.slider("Number of recommendations", 3, 15, 5)
-        run = st.button("🎯 Get Recommendations", type="primary", width='stretch')
-
-    with col2:
-        user_row = users[users["UserID"] == user_id]
-        if not user_row.empty:
-            u = user_row.iloc[0]
-            st.markdown("**User profile**")
-            uc1, uc2, uc3 = st.columns(3)
-            uc1.write(f"**Gender:** {'Male' if u['Gender']=='M' else 'Female'}")
-            uc2.write(f"**Age group:** {AGE_MAP.get(u['Age'], u['Age'])}")
-            uc3.write(f"**Occupation:** {OCCUPATION_MAP.get(u['Occupation'], 'unknown')}")
-
-    if run:
-        recs, liked_titles = core.get_top_n_recommendations(rules, user_id, ratings, movies, n=n_recs)
-
-        st.markdown("---")
-        st.subheader(f"⭐ Movies User #{user_id} already liked (rated ≥ {RATING_THRESHOLD})")
-        if liked_titles:
-            liked_list = sorted(liked_titles)
-            st.write(", ".join(liked_list[:15]) + (" ..." if len(liked_list) > 15 else ""))
-        else:
-            st.info("This user has no ratings ≥ 4, so no rule-based recommendation can be generated.")
-
-        st.subheader("🎬 Recommended Movies")
-        if recs:
-            rec_df = pd.DataFrame(recs, columns=["Title", "Recommendation Score (Σ lift)"])
-            rec_df.index += 1
-            st.dataframe(rec_df, width='stretch')
-        else:
-            st.warning("No recommendations found for this user with the current model settings. "
-                       "Try lowering the min support / min lift in the sidebar.")
-
-
-elif page == "✨ New Session (Cold Start)":
-    st.title("✨ New User Session (Cold Start)")
-    st.markdown(
-        "Simulate a brand-new visitor with no rating history. Pick a few movies they "
-        "just said they like, and the engine instantly returns correlated recommendations "
-        "— no retraining needed."
+    ratings = pd.read_csv(
+        f"{data_dir}/ratings.dat", sep="::", engine="python",
+        names=["UserID", "MovieID", "Rating", "Timestamp"], encoding="latin-1",
     )
-
-    all_titles = sorted(movies["Title"].unique())
-    default_titles = [t for t in [
-        "Star Wars: Episode IV - A New Hope (1977)",
-        "Jurassic Park (1993)",
-        "Matrix, The (1999)",
-    ] if t in all_titles]
-
-    selected = st.multiselect("Movies this session likes:", all_titles, default=default_titles)
-    n_recs = st.slider("Number of recommendations", 3, 15, 5, key="cold_n")
-
-    if st.button("⚡ Get Instant Recommendations", type="primary"):
-        if not selected:
-            st.warning("Pick at least one movie first.")
-        else:
-            recs = core.cold_start_recommendations(rules, selected, n=n_recs)
-            st.subheader("🎬 Recommended for this session")
-            if recs:
-                rec_df = pd.DataFrame(recs, columns=["Title", "Recommendation Score (Σ lift)"])
-                rec_df.index += 1
-                st.dataframe(rec_df, width='stretch')
-            else:
-                st.warning("No rules matched this combination. Try different or fewer movies, "
-                           "or lower the min support / min lift in the sidebar.")
-
-
-elif page == "🔗 Association Rules Explorer":
-    st.title("🔗 Association Rules Explorer")
-    st.markdown("Browse the mined rules directly, ranked by lift.")
-
-    search = st.text_input("Filter by movie title (in antecedents or consequents)")
-    top_n = st.slider("Rows to show", 10, 200, 25)
-
-    display_rules = rules.copy()
-    display_rules["antecedents"] = display_rules["antecedents"].apply(lambda x: ", ".join(x))
-    display_rules["consequents"] = display_rules["consequents"].apply(lambda x: ", ".join(x))
-
-    if search:
-        mask = (
-            display_rules["antecedents"].str.contains(search, case=False, na=False)
-            | display_rules["consequents"].str.contains(search, case=False, na=False)
-        )
-        display_rules = display_rules[mask]
-
-    cols = ["antecedents", "consequents", "support", "confidence", "lift"]
-    st.dataframe(display_rules[cols].head(top_n), width='stretch')
-    st.caption(f"Showing {min(top_n, len(display_rules))} of {len(display_rules):,} matching rules.")
-
-
-elif page == "📈 Model Evaluation":
-    st.title("📈 Model Evaluation — Precision & Recall")
-    st.markdown(
-        "Runs the same train/test evaluation as the notebook: 80/20 split per user, "
-        "then checks whether the top-K recommendations show up in each user's held-out "
-        "positive ratings."
+    users = pd.read_csv(
+        f"{data_dir}/users.dat", sep="::", engine="python",
+        names=["UserID", "Gender", "Age", "Occupation", "Zip-code"], encoding="latin-1",
     )
+    ratings["DateTime"] = pd.to_datetime(ratings["Timestamp"], unit="s")
+    return movies, ratings, users
 
-    col1, col2 = st.columns(2)
-    sample_size = col1.slider("Number of test users to evaluate", 50, 2000, 300, 50)
-    k = col2.slider("Top-K recommendations", 3, 15, 5)
 
-    if st.button("▶️ Run Evaluation", type="primary"):
-        train_ratings, test_ratings = cached_train_test_split(ratings, cache_key="split_v1")
-        progress = st.progress(0.0)
+def train_apriori_model(movies, ratings, min_support=0.05, min_lift=1.2):
+    positive_ratings = ratings[ratings["Rating"] >= RATING_THRESHOLD]
+    ratings_with_titles = pd.merge(positive_ratings, movies, on="MovieID")
+    transactions = ratings_with_titles.groupby("UserID")["Title"].apply(list).tolist()
 
-        t0 = time.time()
-        results_df = core.evaluate_apriori_recommender(
-            rule_index, train_ratings, test_ratings, movies,
-            sample_size=sample_size, k=k, progress_cb=progress.progress,
-        )
-        elapsed = time.time() - t0
+    te = TransactionEncoder()
+    te_ary = te.fit(transactions).transform(transactions)
+    df_encoded = pd.DataFrame(te_ary, columns=te.columns_)
 
-        if results_df.empty:
-            st.warning("No valid test users found (try a different sample size or model settings).")
+    # low_memory=True keeps peak RAM low (critical on memory-limited hosts like
+    # Streamlit Community Cloud's free tier, which caps apps at ~1GB RAM).
+    frequent_itemsets = apriori(df_encoded, min_support=min_support, use_colnames=True,
+                                 max_len=2, low_memory=True)
+    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=min_lift)
+    rules = rules.sort_values(by=["lift", "confidence"], ascending=False).reset_index(drop=True)
+
+    return frequent_itemsets, rules, len(transactions), df_encoded.shape[1]
+
+
+def build_rule_index(rules_df):
+    index = defaultdict(list)
+    for _, row in rules_df.iterrows():
+        antecedents = frozenset(row["antecedents"])
+        index[antecedents].append((tuple(row["consequents"]), float(row["lift"])))
+    return index
+
+
+def get_top_n_recommendations(rules_df, user_id, ratings_df, movies_df, n=5):
+    user_history = ratings_df[(ratings_df["UserID"] == user_id) & (ratings_df["Rating"] >= RATING_THRESHOLD)]
+    liked_titles = set(pd.merge(user_history, movies_df, on="MovieID")["Title"])
+
+    if not liked_titles:
+        return [], liked_titles
+
+    recommendation_map = defaultdict(float)
+    for _, row in rules_df.iterrows():
+        antecedents = set(row["antecedents"])
+        if antecedents.issubset(liked_titles):
+            for candidate in row["consequents"]:
+                if candidate not in liked_titles:
+                    recommendation_map[candidate] += row["lift"]
+
+    sorted_predictions = sorted(recommendation_map.items(), key=lambda x: x[1], reverse=True)
+    return sorted_predictions[:n], liked_titles
+
+
+def cold_start_recommendations(rules_df, selected_titles, n=5):
+    selected_titles = set(selected_titles)
+    recommendation_map = defaultdict(float)
+    for _, row in rules_df.iterrows():
+        antecedents = set(row["antecedents"])
+        if antecedents.issubset(selected_titles):
+            for candidate in row["consequents"]:
+                if candidate not in selected_titles:
+                    recommendation_map[candidate] += row["lift"]
+    return sorted(recommendation_map.items(), key=lambda x: x[1], reverse=True)[:n]
+
+
+def make_train_test_split(ratings_df, test_size_ratio=0.2, seed=42):
+    np.random.seed(seed)
+    test_indices = []
+    for user_id, group in ratings_df.groupby("UserID"):
+        n_test = max(1, int(len(group) * test_size_ratio))
+        if len(group) > n_test:
+            test_idx = group.sample(n=n_test, random_state=seed).index
+            test_indices.extend(test_idx)
+    test_ratings = ratings_df.loc[test_indices].copy()
+    train_ratings = ratings_df.drop(test_indices).copy()
+    return train_ratings, test_ratings
+
+
+def evaluate_apriori_recommender(rule_index, train_ratings_df, test_ratings_df, movies_df,
+                                  sample_size=300, k=5, progress_cb=None):
+    test_users = list(test_ratings_df["UserID"].unique())
+    if sample_size:
+        test_users = test_users[:sample_size]
+
+    results = []
+    total = len(test_users)
+    for idx, user_id in enumerate(test_users, 1):
+        if progress_cb and total and idx % max(1, total // 20) == 0:
+            progress_cb(idx / total)
+
+        user_test = test_ratings_df[test_ratings_df["UserID"] == user_id]
+        ground_truth_movies = set(user_test[user_test["Rating"] >= RATING_THRESHOLD]["MovieID"].tolist())
+        if len(ground_truth_movies) == 0:
+            continue
+
+        user_history = train_ratings_df[
+            (train_ratings_df["UserID"] == user_id) & (train_ratings_df["Rating"] >= RATING_THRESHOLD)
+        ]
+        liked_titles = set(pd.merge(user_history, movies_df, on="MovieID")["Title"])
+
+        recommendation_map = defaultdict(float)
+        candidate_antecedents = [frozenset([title]) for title in liked_titles]
+        if len(liked_titles) > 1:
+            candidate_antecedents += [frozenset(pair) for pair in itertools.combinations(liked_titles, 2)]
+        for antecedent in candidate_antecedents:
+            for consequents, lift in rule_index.get(antecedent, []):
+                for candidate in consequents:
+                    if candidate not in liked_titles:
+                        recommendation_map[candidate] += lift
+
+        sorted_predictions = sorted(recommendation_map.items(), key=lambda x: x[1], reverse=True)[:k]
+        recommended_titles = set(title for title, _ in sorted_predictions)
+
+        recommended_movies = set()
+        for title in recommended_titles:
+            movie_rows = movies_df[movies_df["Title"] == title]["MovieID"].values
+            if len(movie_rows) > 0:
+                recommended_movies.add(movie_rows[0])
+
+        if len(recommended_movies) == 0:
+            precision, recall = 0.0, 0.0
         else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Average Precision", f"{results_df['Precision'].mean():.4f}")
-            c2.metric("Average Recall", f"{results_df['Recall'].mean():.4f}")
-            c3.metric("Users evaluated", f"{len(results_df):,}")
-            st.caption(f"Evaluation completed in {elapsed:.1f}s")
+            precision = len(ground_truth_movies & recommended_movies) / len(recommended_movies)
+            recall = len(ground_truth_movies & recommended_movies) / len(ground_truth_movies)
 
-            fig = px.histogram(
-                results_df, x="Precision", nbins=20, title="Precision Distribution Across Users",
-                color_discrete_sequence=["#458588"],
-            )
-            st.plotly_chart(fig, width='stretch')
+        results.append({
+            "UserID": user_id, "Precision": precision, "Recall": recall,
+            "GT_Size": len(ground_truth_movies), "Rec_Size": len(recommended_movies),
+        })
 
-            st.dataframe(results_df.head(50), width='stretch')
+    if progress_cb:
+        progress_cb(1.0)
+
+    return pd.DataFrame(results)
